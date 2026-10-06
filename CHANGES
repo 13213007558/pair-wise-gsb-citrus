@@ -1,3 +1,12 @@
+= Unreleased
+
+  * Added Rule#parse_fold and GrammarMethods#parse_fold. Folding parses
+    compute each rule's value from a pure function (declared with
+    GrammarMethods#fold or supplied via the :folder option) as soon as the
+    rule completes, returning a single aggregate value without ever building
+    a Match tree. Values computed on backtracking branches are discarded, and
+    memoized fold caches are never shared between different folders.
+
 = 3.0.3
 
   * Fix source code for ruby 2.7 compatibility.

@@ -344,6 +344,122 @@ module Citrus
     end
   end
 
+  # A FoldingInput is an Input that computes a folded value for each rule as
+  # soon as the rule completes, using the pure function declared for that
+  # rule (see GrammarMethods#fold and Rule#fold_value). Because values are
+  # folded bottom-up while parsing, no Match objects are ever built, which
+  # makes folding parses considerably cheaper in terms of memory than
+  # building an entire Match tree and reducing it afterwards.
+  #
+  # Folded values are tracked on a stack that is associated with the event
+  # stream they belong to. When a rule fails, any values that were produced
+  # while attempting it are discarded together with its events, so values
+  # computed on backtracking branches are never committed to a parent rule.
+  class FoldingInput < Input
+    def initialize(source, folder=nil)
+      super(source)
+      @folder = folder
+      @value_stacks = ObjectSpace::WeakMap.new
+    end
+
+    # A Hash mapping rule names to callables that overrides any folds
+    # declared on the rules themselves, or +nil+.
+    attr_reader :folder
+
+    # Returns the stack of folded values that is associated with the given
+    # event stream. After a successful parse the folded value of the root
+    # rule is the last value in the stack of the root event stream.
+    def values_for(events)
+      @value_stacks[events] || []
+    end
+
+  private
+
+    def apply_rule(rule, position, events) # :nodoc:
+      stack = (@value_stacks[events] ||= [])
+      index = events.size
+      depth = stack.size
+
+      rule.exec(self, events)
+
+      if events.size > index
+        children = stack.slice!(depth, stack.size - depth) || []
+        string = self.string[position, events[-1]]
+        stack << rule.fold_value(children, string, @folder)
+      else
+        # The rule failed, so roll back any values that were produced while
+        # attempting it. This keeps values computed on backtracking branches
+        # from ever being committed to a parent rule.
+        stack.slice!(depth, stack.size - depth)
+      end
+
+      events
+    end
+  end
+
+  # A MemoizedFoldingInput is a FoldingInput that memoizes folded values
+  # together with their event stream segments, much like MemoizedInput does
+  # for plain parses. The cache lives on the input object itself and a fresh
+  # input is created for every Rule#parse_fold call, so values that were
+  # folded with one set of fold functions are never served to a parse that
+  # uses another.
+  class MemoizedFoldingInput < MemoizedInput
+    def initialize(source, folder=nil)
+      super(source)
+      @folder = folder
+      @value_stacks = ObjectSpace::WeakMap.new
+    end
+
+    # A Hash mapping rule names to callables that overrides any folds
+    # declared on the rules themselves, or +nil+.
+    attr_reader :folder
+
+    # Returns the stack of folded values that is associated with the given
+    # event stream.
+    def values_for(events)
+      @value_stacks[events] || []
+    end
+
+  private
+
+    def apply_rule(rule, position, events) # :nodoc:
+      stack = (@value_stacks[events] ||= [])
+      memo = @cache[rule] ||= {}
+
+      if memo.key?(position)
+        @cache_hits += 1
+        cached = memo[position]
+
+        unless cached.empty?
+          events.concat(cached[0])
+          self.pos += events[-1]
+          stack << cached[1]
+        end
+      else
+        index = events.size
+        depth = stack.size
+
+        rule.exec(self, events)
+
+        if events.size > index
+          children = stack.slice!(depth, stack.size - depth) || []
+          string = self.string[position, events[-1]]
+          value = rule.fold_value(children, string, @folder)
+          stack << value
+
+          # Memoize the folded value alongside the events so we can replay
+          # both next time this same rule is executed at this position.
+          memo[position] = [events.slice(index, events.size), value]
+        else
+          stack.slice!(depth, stack.size - depth)
+          memo[position] = []
+        end
+      end
+
+      events
+    end
+  end
+
   # Inclusion of this module into another extends the receiver with the grammar
   # helper methods in GrammarMethods. Although this module does not actually
   # provide any methods, constants, or variables to modules that include it, the
@@ -397,6 +513,17 @@ module Citrus
     def parse_file(path, options={})
       path = Pathname.new(path.to_str) unless Pathname === path
       parse(path, options)
+    end
+
+    # Parses the given +source+ using this grammar's root rule and returns a
+    # single folded value instead of a Match tree. Accepts the same +options+
+    # as #parse, plus those of Rule#parse_fold.
+    def parse_fold(source, options={})
+      rule_name = options.delete(:root) || root
+      raise Error, "No root rule specified" unless rule_name
+      rule = rule(rule_name)
+      raise Error, "No rule named \"#{rule_name}\"" unless rule
+      rule.parse_fold(source, options)
     end
 
     # Returns the name of this grammar as a string.
@@ -580,6 +707,21 @@ module Citrus
       rule.extension = Module.new(&block)
       rule
     end
+
+    # Specifies a pure function that is used to compute the folded value of
+    # the given +rule+ when parsing with Rule#parse_fold. The block is called
+    # with an array of the folded values of the rule's immediate children and
+    # the matched string as soon as the rule completes, e.g.:
+    #
+    #     rule :number do
+    #       fold(/[0-9]+/) {|children, string| string.to_i }
+    #     end
+    #
+    def fold(rule, &block)
+      rule = Rule.for(rule)
+      rule.fold = block if block
+      rule
+    end
   end
 
   # A Rule is an object that is used by a grammar to create matches on an
@@ -637,6 +779,20 @@ module Citrus
     # The module this rule uses to extend new matches.
     attr_reader :extension
 
+    # Specifies a pure function that is used to compute the folded value of
+    # matches that result from this rule when parsing with #parse_fold. The
+    # given object must respond to +call+ and is invoked with an array of
+    # the folded values of the rule's immediate children and the matched
+    # string. See GrammarMethods#fold.
+    def fold=(fold)
+      raise ArgumentError, "Fold must respond to #call" unless fold.respond_to?(:call)
+
+      @fold = fold
+    end
+
+    # The pure function this rule uses to compute folded values.
+    attr_reader :fold
+
     # The default set of options to use when calling #parse.
     def default_options # :nodoc:
       { :consume  => true,
@@ -670,6 +826,62 @@ module Citrus
       end
 
       Match.new(input, events, opts[:offset])
+    end
+
+    # Attempts to parse the given +source+ and return a single folded value
+    # instead of a Match tree. Each rule's folded value is computed from the
+    # pure function declared for it (see GrammarMethods#fold) as soon as the
+    # rule completes, so no Match objects are ever built. Accepts the same
+    # +options+ as #parse, plus the following:
+    #
+    # folder::  A Hash mapping rule names to callables that is consulted
+    #           before any fold declared on a rule itself. This makes it
+    #           possible to evaluate the same grammar with different
+    #           algebras. Defaults to +nil+.
+    #
+    # Values that are computed on backtracking branches are discarded and
+    # never committed to a parent rule. When +memoize+ is true, folded
+    # values are cached on a fresh MemoizedFoldingInput for the duration of
+    # this call only, so cached values are never shared between different
+    # folders.
+    def parse_fold(source, options={})
+      opts = default_options.merge(options)
+      folder = opts.delete(:folder)
+
+      input = (opts[:memoize] ? MemoizedFoldingInput : FoldingInput).new(source, folder)
+      string = input.string
+      input.pos = opts[:offset] if opts[:offset] > 0
+
+      events = input.exec(self)
+      length = events[-1]
+
+      if !length || (opts[:consume] && length < (string.length - opts[:offset]))
+        raise ParseError, input
+      end
+
+      input.values_for(events).last
+    end
+
+    # Computes the folded value of a match of this rule from the folded
+    # values of its immediate +children+ and the matched +string+. If a
+    # +folder+ is given it is consulted first (by rule name), followed by
+    # any fold declared on the rule itself. When no fold is declared, the
+    # value of a single child is passed through, the matched string is used
+    # when there are no children, and an array of child values is used
+    # otherwise.
+    def fold_value(children, string, folder=nil) # :nodoc:
+      func = folder && name ? folder[name] : nil
+      func ||= fold
+
+      if func
+        func.call(children, string)
+      elsif children.empty?
+        string
+      elsif children.length == 1
+        children.first
+      else
+        children
+      end
     end
 
     # Tests whether or not this rule matches on the given +string+. Returns the
@@ -790,6 +1002,13 @@ module Citrus
     # its event stream.
     def elide? # :nodoc:
       rule.elide?
+    end
+
+    # Proxy objects are transparent when folding: the folded value of the
+    # rule they are proxy for is passed through unchanged, so a fold that is
+    # declared for the underlying rule is applied exactly once.
+    def fold_value(children, string, folder=nil) # :nodoc:
+      children.first
     end
 
     def extend_match(match) # :nodoc:

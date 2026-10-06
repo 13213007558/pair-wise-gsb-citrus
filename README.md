@@ -499,6 +499,64 @@ This method of defining extensions can help keep your grammar files cleaner.
 However, you do need to make sure that your extension modules are already loaded
 before using `Citrus.load` to load your grammar file.
 
+## Folding
+
+Sometimes all you need from a parse is a single aggregate value, and building
+the entire tree of
+[Match](http://mjackson.github.io/citrus/api/classes/Citrus/Match.html)
+objects just to reduce it afterwards wastes both time and memory. Use
+`parse_fold` to compute a folded value for each rule with a pure function as
+soon as the rule completes, so no Match objects are ever built.
+
+Fold functions are declared with `fold` and are called with an array of the
+folded values of the rule's immediate children and the matched string.
+
+    Sum = Citrus::Grammar.new do
+      root :sum
+
+      rule :number do
+        fold(/[0-9]+/) {|children, string| string.to_i }
+      end
+
+      rule :item do
+        fold(all(',', :number)) {|children, _| children[1] }
+      end
+
+      rule :items do
+        fold(zero_or_more(:item)) {|children, _| children }
+      end
+
+      rule :sum do
+        fold(all(:number, :items)) {|children, _|
+          children[0] + children[1].inject(0, :+)
+        }
+      end
+    end
+
+    Sum.parse_fold('1,2,3')
+    # => 6
+
+Rules without a declared fold pass through the value of a single child, use
+the matched string when they have no children, and use an array of child
+values otherwise. Proxy rules (aliases and `super`) are transparent and
+always pass through the value of the rule they stand in for.
+
+Values that are computed while attempting a branch that later fails are
+discarded together with that branch, so backtracking never leaks intermediate
+values into the result.
+
+`parse_fold` accepts the same options as `parse` (`:consume`, `:memoize`,
+`:offset`), plus a `:folder` option that maps rule names to callables and
+overrides any folds declared on the rules themselves. This makes it possible
+to evaluate the same grammar with different algebras.
+
+    folder = { :number => ->(children, string) { string.to_i * 10 } }
+    Sum.parse_fold('1,2,3', :folder => folder)
+    # => 60
+
+When `:memoize` is true, folded values are cached on a fresh input object
+for the duration of that call only, so cached values are never shared between
+different folders.
 
 # Testing
 
