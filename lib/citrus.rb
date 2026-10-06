@@ -174,6 +174,8 @@ module Citrus
       super(source_text(source))
       @source = source
       @max_offset = 0
+      @bindings = {}
+      @binding_stack = []
     end
 
     # The maximum offset in the input that was successfully parsed.
@@ -185,7 +187,34 @@ module Citrus
 
     def reset # :nodoc:
       @max_offset = 0
+      @bindings.clear
+      @binding_stack.clear
       super
+    end
+
+    # A hash of names to values that Dependent rules have bound during the
+    # current parse. This is the local capture environment that Dependent
+    # blocks may consult when selecting a continuation rule.
+    attr_reader :bindings
+
+    # Binds +value+ to +name+ in the current binding environment. Any
+    # previous binding for +name+ is saved so it can be restored by
+    # #pop_binding, which allows nested bindings of the same name to shadow
+    # (but never pollute) outer bindings.
+    def push_binding(name, value) # :nodoc:
+      @binding_stack << [name, @bindings[name], @bindings.key?(name)]
+      @bindings[name] = value
+    end
+
+    # Restores the binding environment to the state it was in before the
+    # most recent #push_binding.
+    def pop_binding # :nodoc:
+      name, old_value, existed = @binding_stack.pop
+      if existed
+        @bindings[name] = old_value
+      else
+        @bindings.delete(name)
+      end
     end
 
     # Returns an array containing the lines of text in the input.
@@ -323,24 +352,33 @@ module Citrus
 
     def apply_rule(rule, position, events) # :nodoc:
       memo = @cache[rule] ||= {}
+      key  = bindings.empty? ? position : [position, bindings.dup]
 
-      if memo[position]
+      if memo.key?(key)
         @cache_hits += 1
-        c = memo[position]
+        c = memo[key]
         unless c.empty?
           events.concat(c)
-          self.pos += events[-1]
+          self.pos += byte_length(events[-1])
         end
       else
         index = events.size
         rule.exec(self, events)
 
         # Memoize the result so we can use it next time this same rule is
-        # executed at this position.
-        memo[position] = events.slice(index, events.size)
+        # executed at this position. Because Dependent rules may consult the
+        # current binding environment when matching, the environment is part
+        # of the cache key whenever any bindings are active.
+        memo[key] = events.slice(index, events.size)
       end
 
       events
+    end
+
+    # Returns the number of bytes occupied by the next +length+ characters
+    # of the input starting at the current pointer position.
+    def byte_length(length) # :nodoc:
+      string.byteslice(pos, string.bytesize - pos).to_s[0, length].to_s.bytesize
     end
   end
 
@@ -520,6 +558,47 @@ module Citrus
     # to specify semantic behavior (via #ext).
     def butp(rule, &block)
       ext(ButPredicate.new(rule), block)
+    end
+
+    # Creates a new Dependent using the given +rule+. After +rule+ matches,
+    # its value and the current binding environment are passed to the given
+    # block, and the rule the block returns is matched next. This allows the
+    # remainder of a parse to depend on a value that was parsed earlier,
+    # e.g. a length or count prefix in a protocol.
+    #
+    #     dependent(/[0-9]+/) {|len| chars(len.to_i) }
+    #
+    def dependent(rule, &block)
+      Dependent.new(rule, &block)
+    end
+
+    # Like #dependent, but also binds the value of +rule+ to +name+ in the
+    # local capture environment for the duration of the continuation. The
+    # binding is visible to the block (via the environment) and to any
+    # Dependent rules nested inside the continuation. Bindings are scoped:
+    # a nested binding of the same +name+ shadows the outer binding without
+    # polluting it, and all bindings are removed when the Dependent finishes
+    # or fails.
+    #
+    #     bind(/[0-9]+/, :n) {|n, env| chars(n.to_i) }
+    #
+    def bind(rule, name, &block)
+      Dependent.new(rule, name, &block)
+    end
+
+    # Creates a new Chars rule that matches exactly +count+ characters
+    # (including newlines). Fails without consuming any input when fewer
+    # than +count+ characters remain. A block may be provided to specify
+    # semantic behavior (via #ext).
+    def chars(count, &block)
+      ext(Chars.new(count), block)
+    end
+
+    # Creates a new Bytes rule that matches exactly +count+ bytes. Fails
+    # without consuming any input when fewer than +count+ bytes remain.
+    # A block may be provided to specify semantic behavior (via #ext).
+    def bytes(count, &block)
+      ext(Bytes.new(count), block)
     end
 
     # Creates a new Repeat using the given +rule+. +min+ and +max+ specify the
@@ -969,6 +1048,130 @@ module Citrus
     end
   end
 
+  # A Chars is a Terminal that matches exactly #count characters, including
+  # newlines. It is typically used as the continuation of a Dependent rule
+  # to consume a payload whose length (in characters) was parsed earlier.
+  # Negative counts are rejected when the rule is created; a count that
+  # exceeds the remaining input fails immediately without consuming input.
+  class Chars
+    include Rule
+
+    def initialize(count=0)
+      count = Integer(count)
+      raise ArgumentError, "Character count cannot be negative: #{count}" if count < 0
+      @count = count
+      @regexp = /.{#{count}}/mu
+    end
+
+    # The number of characters this rule matches.
+    attr_reader :count
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      match = input.scan(@regexp)
+
+      if match
+        events << self
+        events << CLOSE
+        events << match.length
+      end
+
+      events
+    end
+
+    def ==(other)
+      case other
+      when Chars
+        count == other.count
+      else
+        super
+      end
+    end
+
+    alias_method :eql?, :==
+
+    # Chars rules with the same count are considered equal so that memoized
+    # results are shared between continuations that depend on the same value.
+    def hash
+      [self.class, count].hash
+    end
+
+    # Returns +true+ if this rule is a Terminal.
+    def terminal? # :nodoc:
+      true
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      "chars(#{count})"
+    end
+  end
+
+  # A Bytes is a Terminal that matches exactly #count bytes. It is typically
+  # used as the continuation of a Dependent rule to consume a payload whose
+  # length (in bytes) was parsed earlier. Negative counts are rejected when
+  # the rule is created; a count that exceeds the remaining input fails
+  # immediately without consuming input.
+  #
+  # Note: When the input contains multibyte characters, byte counts should
+  # align to character boundaries for captures to be meaningful.
+  class Bytes
+    include Rule
+
+    def initialize(count=0)
+      count = Integer(count)
+      raise ArgumentError, "Byte count cannot be negative: #{count}" if count < 0
+      @count = count
+    end
+
+    # The number of bytes this rule matches.
+    attr_reader :count
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      string = input.to_str
+      start = input.pos
+
+      if count <= string.bytesize - start
+        chunk = string.byteslice(start, count)
+        input.pos = start + count
+
+        events << self
+        events << CLOSE
+        events << chunk.length
+      end
+
+      events
+    end
+
+    def ==(other)
+      case other
+      when Bytes
+        count == other.count
+      else
+        super
+      end
+    end
+
+    alias_method :eql?, :==
+
+    # Bytes rules with the same count are considered equal so that memoized
+    # results are shared between continuations that depend on the same value.
+    def hash
+      [self.class, count].hash
+    end
+
+    # Returns +true+ if this rule is a Terminal.
+    def terminal? # :nodoc:
+      true
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      "bytes(#{count})"
+    end
+  end
+
   # A Nonterminal is a Rule that augments the matching behavior of one or more
   # other rules. Nonterminals may not match directly on the input, but instead
   # invoke the rule(s) they contain to determine if a match can be made from
@@ -1264,6 +1467,91 @@ module Citrus
     # Returns the Citrus notation of this rule as a string.
     def to_citrus # :nodoc:
       rules.map {|r| r.to_embedded_s }.join(' | ')
+    end
+  end
+
+  # A Dependent is a Nonterminal that matches its rule and then uses the
+  # resulting value to select the rule that matches next. When the Dependent
+  # is created with a +binding_name+ (see GrammarMethods#bind), the value is
+  # also bound to that name in the input's local capture environment for the
+  # duration of the continuation.
+  #
+  # The block given at creation time receives the value of the first match
+  # and the current binding environment (a Hash) and must return an object
+  # that can be converted to a rule (see Rule.for). The returned rule is
+  # then matched immediately after the first.
+  #
+  # Bindings are dynamically scoped: they are visible to the continuation
+  # (including Dependent rules nested inside it), nested bindings of the
+  # same name shadow outer bindings without polluting them, and the
+  # environment is always restored when the Dependent finishes, whether or
+  # not the continuation matched.
+  class Dependent
+    include Nonterminal
+
+    def initialize(rule='', binding_name=nil, &block)
+      raise ArgumentError, 'Dependent rules require a block' unless block
+      super([rule])
+      @binding_name = binding_name && binding_name.to_sym
+      @block = block
+    end
+
+    # The Rule object that matches first.
+    def rule
+      rules[0]
+    end
+
+    # The name this rule's value is bound to in the local capture
+    # environment while the continuation matches, if any.
+    attr_reader :binding_name
+
+    # The block that selects the continuation rule.
+    attr_reader :block
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      events << self
+
+      start = events.size - 1
+      index = events.size
+      offset = input.charpos
+
+      if input.exec(rule, events).size > index
+        length = events[-1]
+        value = Match.new(input, events[index..-1], offset).value
+
+        input.push_binding(binding_name, value) if binding_name
+
+        begin
+          continuation = Rule.for(block.call(value, input.bindings.dup))
+          continuation.grammar = grammar if grammar && !continuation.grammar
+
+          index = events.size
+
+          if input.exec(continuation, events).size > index
+            length += events[-1]
+            events << CLOSE
+            events << length
+          else
+            events.slice!(start, events.size - start)
+          end
+        ensure
+          input.pop_binding if binding_name
+        end
+      else
+        events.pop
+      end
+
+      events
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      if binding_name
+        "bind(#{binding_name}:#{rule.to_embedded_s})"
+      else
+        "dependent(#{rule.to_embedded_s})"
+      end
     end
   end
 

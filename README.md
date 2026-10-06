@@ -302,6 +302,53 @@ space between `'a'` and `'b'`.
     'a' ('b' | 'c')   # match "a", then "b" or "c"
 
 
+## Dependent Rules
+
+When defining grammars in Ruby, the `dependent` and `bind` combinators allow
+the remainder of a parse to depend on a value that was parsed earlier. This is
+useful for protocols where a length or count prefix determines how much input
+follows. After the first rule matches, its value and the current binding
+environment are passed to a block, and the rule the block returns is matched
+next.
+
+    rule :payload do
+      # Parse a decimal length prefix, then match exactly that many
+      # characters. Use bytes(n) instead of chars(n) when the prefix
+      # is a byte count.
+      bind(/[0-9]+/, :n) {|n, env| chars(n.to_i) }
+    end
+
+`bind` additionally binds the value to a name in a local capture environment
+that is visible to the block (via `env`) and to any dependent rules nested
+inside the continuation. Bindings are dynamically scoped: a nested binding of
+the same name shadows the outer binding without polluting it, and the
+environment is restored when the dependent rule finishes or fails.
+
+The `chars` and `bytes` helpers create rules that match an exact number of
+characters or bytes respectively. Negative counts are rejected when the rule
+is created, and a count that exceeds the remaining input fails immediately
+without consuming any input. When memoization is enabled, the binding
+environment is part of the cache key, so cached results are never shared
+between different dependent values.
+
+    WordList = Citrus::Grammar.new do
+      rule :count do
+        ext(/[0-9]+/) { to_str.to_i }
+      end
+
+      rule :word do
+        /[a-z]+/
+      end
+
+      rule :list do
+        # A count prefix followed by exactly that many words.
+        bind(:count, :n) {|n| rep(all(' ', :word), n, n) }
+      end
+    end
+
+    WordList.parse('3 apple banana cherry')
+
+
 # Example
 
 

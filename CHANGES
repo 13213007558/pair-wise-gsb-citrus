@@ -1,3 +1,19 @@
+= Unreleased
+
+  * Added Dependent rules (GrammarMethods#dependent and #bind) that select a
+    continuation rule based on the value of a previous match, with a local
+    capture environment for bindings. Bindings are dynamically scoped:
+    nested bindings of the same name shadow outer bindings, and the
+    environment is restored when a dependent rule finishes or fails.
+  * Added Chars and Bytes rules (GrammarMethods#chars and #bytes) that match
+    an exact number of characters or bytes. Negative counts are rejected up
+    front and counts that exceed the remaining input fail without consuming
+    any input.
+  * MemoizedInput now includes the binding environment in its cache key when
+    bindings are active, so cached results are never shared between different
+    dependent values, and advances the pointer by bytes (not characters) on
+    cache hits so memoized parses of multibyte input stay aligned.
+
 = 3.0.3
 
   * Fix source code for ruby 2.7 compatibility.
