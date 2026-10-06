@@ -174,6 +174,7 @@ module Citrus
       super(source_text(source))
       @source = source
       @max_offset = 0
+      @bindings = {}
     end
 
     # The maximum offset in the input that was successfully parsed.
@@ -183,8 +184,23 @@ module Citrus
     # or a Pathname.
     attr_reader :source
 
+    # Capture bindings that are visible while rules are executing.
+    attr_reader :bindings
+
+    # Runs a block with bindings that are local to that block. The original
+    # bindings are restored when the block returns, even when a nested binding
+    # uses the same name.
+    def with_bindings(bindings={})
+      saved = @bindings
+      @bindings = saved.merge(bindings)
+      yield
+    ensure
+      @bindings = saved
+    end
+
     def reset # :nodoc:
       @max_offset = 0
+      @bindings.clear
       super
     end
 
@@ -246,11 +262,13 @@ module Citrus
     def exec(rule, events=[])
       position = pos
       index = events.size
+      saved_bindings = @bindings.dup
 
       if apply_rule(rule, position, events).size > index
         @max_offset = pos if pos > @max_offset
       else
         self.pos = position
+        @bindings.replace(saved_bindings)
       end
 
       events
@@ -260,9 +278,74 @@ module Citrus
     # position, +nil+ if none can be made.
     def test(rule)
       position = pos
+      saved_bindings = @bindings.dup
       events = apply_rule(rule, position, [])
       self.pos = position
+      @bindings.replace(saved_bindings)
       events[-1]
+    end
+
+    # Matches and consumes an explicit-length prefix. Length is measured in
+    # characters for +:characters+ and bytes for +:bytes+. A byte length may
+    # not split a UTF-8 character.
+    def length_prefix(length, unit)
+      return nil unless length.respond_to?(:to_int)
+
+      length = length.to_int
+      remaining = rest
+      piece = case unit
+        when :characters
+          return nil if length < 0 || length > remaining.length
+          remaining[0, length]
+        when :bytes
+          return nil if length < 0 || length > remaining.bytesize
+          remaining.byteslice(0, length)
+        else
+          raise ArgumentError, "Invalid length unit: #{unit.inspect}"
+      end
+
+      return nil unless piece
+      expected_size = unit == :characters ? length : nil
+      return nil if unit == :characters && piece.length != length
+      return nil if unit == :bytes && piece.bytesize != length
+
+      if unit == :bytes && !piece.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+        return nil
+      end
+
+      scan(Regexp.new(Regexp.escape(piece))) && piece
+    end
+
+    # Returns the semantic value represented by the given event segment.
+    def event_value(events, position)
+      segment = events.dup
+
+      match = Match.new(self, segment, position)
+      semantic_match_value(match)
+    end
+
+    def semantic_match_value(match) # :nodoc:
+      nested = match.matches
+      return match.value if nested.empty?
+
+      nested.each do |child|
+        if semantic_candidate?(child)
+          rule = child.events.first
+          rule = rule.rule while Proxy === rule
+          rule = rule.rule while Proxy === rule
+          if child.matches.empty? && rule.respond_to?(:extension) && rule.extension
+            rule.extend_match(child)
+          end
+          return semantic_match_value(child)
+        end
+      end
+
+      match.value
+    end
+
+    def semantic_candidate?(match) # :nodoc:
+      return true if match.events.first.respond_to?(:extension) && match.events.first.extension
+      match.matches.any? {|child| semantic_candidate?(child) }
     end
 
     # Returns the scanned string.
@@ -322,13 +405,18 @@ module Citrus
   private
 
     def apply_rule(rule, position, events) # :nodoc:
-      memo = @cache[rule] ||= {}
+      cache_rule = Bind === rule ? rule.binding_name : rule
+      memo = @cache[cache_rule] ||= {}
+      memo_key = [position, bindings.dup]
 
-      if memo[position]
+      if memo.key?(memo_key)
         @cache_hits += 1
-        c = memo[position]
+        c = memo[memo_key]
         unless c.empty?
+          replay_bindings(c, position)
+          first = events.length
           events.concat(c)
+          events[first] = rule
           self.pos += events[-1]
         end
       else
@@ -337,10 +425,39 @@ module Citrus
 
         # Memoize the result so we can use it next time this same rule is
         # executed at this position.
-        memo[position] = events.slice(index, events.size)
+        memo[memo_key] = events.slice(index, events.size)
       end
 
       events
+    end
+
+    def replay_bindings(events, position) # :nodoc:
+      replay_segment(events, 0, position)
+      nil
+    end
+
+    def replay_segment(events, index, position) # :nodoc:
+      start = index
+      rule = events[index]
+      index += 1
+      child_position = position
+      saved_bindings = bindings.dup if Dependent === rule
+
+      until events[index] == CLOSE
+        child_length, index = replay_segment(events, index, child_position)
+        child_position += child_length
+      end
+
+      length = events[index + 1]
+
+      if Bind === rule
+        inner = events.slice(start + 1, index - start - 1)
+        bindings[rule.binding_name] = event_value(inner, position)
+      end
+
+      bindings.replace(saved_bindings) if Dependent === rule
+
+      [length, index + 2]
     end
   end
 
@@ -562,6 +679,31 @@ module Citrus
       rule = ext(rule, block)
       rule.label = label
       rule
+    end
+
+    # Creates a new Bind for the given +rule+. Values matched by the rule are
+    # made available to dependent rules during parsing.
+    def bind(rule, name=nil, &block)
+      ext(Bind.new(rule, name), &block)
+    end
+
+    # Creates a new Dependent rule. Its +rule+ is parsed first; its block is
+    # then called with the resulting value and visible bindings and must return
+    # the rule to parse next.
+    def dependent(rule, &block)
+      Dependent.new(rule, block)
+    end
+
+    # Creates a Length rule measured in characters. Dynamic length values are
+    # supplied by passing a Bind object as +length+.
+    def chars(length)
+      Length.new(length, :characters)
+    end
+
+    # Creates a Length rule measured in bytes. Dynamic length values are
+    # supplied by passing a Bind object as +length+.
+    def bytes(length)
+      Length.new(length, :bytes)
     end
 
     # Specifies a Module that will be used to extend all matches created with
@@ -857,6 +999,163 @@ module Citrus
       end
 
       rule
+    end
+  end
+
+  module Nonterminal
+    include Rule
+  end
+
+  # A Bind matches another rule and makes that match's value available in the
+  # parse-time capture environment. Later dependent rules may read that value.
+  class Bind
+    include Nonterminal
+
+    def initialize(rule='', name=nil)
+      super([rule])
+      @binding_name = name
+    end
+
+    # Returns the Rule object this rule uses to match.
+    def rule
+      rules[0]
+    end
+
+    # The name under which this rule's value is bound during parsing.
+    def binding_name
+      @binding_name ||= rule.label || rule.name or
+        raise Error, "Cannot infer a binding name"
+    end
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      index = events.size
+      position = input.pos
+
+      events << self
+      input.exec(rule, events)
+
+      if events.size > index + 1
+        segment = events.slice((index + 1)..)
+        value = input.event_value(segment, position)
+        input.bindings[binding_name] = value
+
+        events << CLOSE
+        events << segment[-1]
+      else
+        events.slice!(index)
+      end
+
+      events
+    end
+
+    def extend_match(match) # :nodoc:
+      rule.extend_match(match)
+      super
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      "bind(#{rule.to_embedded_s}, #{binding_name.inspect})"
+    end
+  end
+
+  # A Dependent parses one rule, then calls a block with that rule's value and
+  # the current capture environment. The block must return the next rule to
+  # parse. Bindings introduced inside the dependent rule are local and are
+  # restored after it completes.
+  class Dependent
+    include Nonterminal
+
+    def initialize(rule='', block=nil)
+      raise ArgumentError, "A block is required" unless Proc === block
+      super([rule])
+      @block = block
+    end
+
+    # Returns the Rule object this rule uses to match.
+    def rule
+      rules[0]
+    end
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      events << self
+      index = events.size
+      start = index - 1
+      position = input.pos
+      saved_bindings = input.bindings.dup
+
+      input.exec(rule, events)
+
+      if events.size > index
+        prefix_segment = events.slice(index..)
+        value = input.event_value(prefix_segment, position)
+        next_rule = Rule.for(@block.call(value, input.bindings.dup))
+        next_rule.grammar = grammar if grammar
+
+        continuation_start = events.size
+        input.exec(next_rule, events)
+
+        if events.size > continuation_start
+          prefix_length = prefix_segment[-1]
+          continuation_length = events[-1]
+          events << CLOSE
+          events << prefix_length + continuation_length
+        else
+          events.slice!(start)
+        end
+      else
+        events.slice!(start)
+      end
+
+      events
+    ensure
+      input.bindings.replace(saved_bindings)
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      "dependent(#{rule.to_embedded_s})"
+    end
+  end
+
+  # A Length matches an explicitly measured string. Its unit is either
+  # +:characters+ or +:bytes+. Its length may be a static integer or another
+  # rule whose match value responds to #to_int.
+  class Length
+    include Rule
+
+    def initialize(length=0, unit=:characters)
+      raise ArgumentError, "Invalid length unit: #{unit.inspect}" unless [:characters, :bytes].include?(unit)
+      @length = length
+      @unit = unit
+    end
+
+    attr_reader :length
+    attr_reader :unit
+
+    # Returns an array of events for this rule on the given +input+.
+    def exec(input, events=[])
+      piece = input.length_prefix(@length, @unit)
+
+      if piece
+        events << self
+        events << CLOSE
+        events << piece.length
+      end
+
+      events
+    end
+
+    def terminal? # :nodoc:
+      true
+    end
+
+    # Returns the Citrus notation of this rule as a string.
+    def to_citrus # :nodoc:
+      name = @unit == :bytes ? :bytes : :chars
+      "#{name}(#{@length.inspect})"
     end
   end
 
