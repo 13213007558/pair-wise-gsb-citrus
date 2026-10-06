@@ -1,3 +1,13 @@
+= Unreleased
+
+  * Added parse_fold: parse directly to a single folded value without
+    building a tree of Match objects. Folders are pure functions declared
+    per rule (via a hash passed to parse_fold or Rule#folder) and are
+    called with the folded values of a rule's children and its matched
+    string as soon as the rule completes. Values from rolled-back
+    branches are discarded, and memoized fold caches are never shared
+    between different sets of folders.
+
 = 3.0.3
 
   * Fix source code for ruby 2.7 compatibility.

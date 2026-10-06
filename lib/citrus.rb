@@ -344,6 +344,219 @@ module Citrus
     end
   end
 
+  # A MemoizedFoldInput is a MemoizedInput that additionally caches the
+  # folded values of FoldEvents streams. The fold cache is kept separate
+  # from the plain event cache and lives only as long as this input object,
+  # so values that were folded using one set of folders are never served to
+  # a parse that uses a different set of folders.
+  class MemoizedFoldInput < MemoizedInput
+    def reset # :nodoc:
+      @fold_cache.clear if @fold_cache
+      super
+    end
+
+  private
+
+    def apply_rule(rule, position, events) # :nodoc:
+      return super unless FoldEvents === events
+
+      @fold_cache ||= {}
+      memo = @fold_cache[rule] ||= {}
+
+      if (entry = memo[position])
+        @cache_hits += 1
+        events.replay(entry)
+        self.pos += entry[0][-1] unless entry[0].empty?
+      else
+        index = events.size
+        rule.exec(self, events)
+
+        # Memoize the folded segment so we can replay it next time this same
+        # rule is executed at this position.
+        memo[position] = events.segment(index)
+      end
+
+      events
+    end
+  end
+
+  # A FoldEvents is a parse event stream that folds values on the fly, as
+  # rules complete, instead of building a tree of Match objects. It responds
+  # to the same methods that Rule#exec implementations use on a plain events
+  # Array, so all rules work unmodified, but it never instantiates a Match.
+  #
+  # Each time a rule closes, its folded value is computed immediately from
+  # the folded values of its children using the folder (a pure function)
+  # declared for that rule. When a branch is rolled back during backtracking
+  # (e.g. a failed Sequence or Repeat), the values that were computed inside
+  # it are discarded together with its events and are never committed to the
+  # enclosing frame.
+  class FoldEvents
+    # A Frame tracks a single open rule invocation on the fold stack,
+    # including a checkpoint of the offset state so it can be restored when
+    # the frame's events are rolled back.
+    Frame = Struct.new(:rule, :start, :children, :offset, :last_length)
+
+    # +folders+ maps rule names (or Rule objects) to callables, +source+ is
+    # the string being parsed, and +offset+ is the offset at which parsing
+    # started.
+    def initialize(folders={}, source='', offset=0)
+      @folders = folders || {}
+      @source = source
+      @events = []
+      @stack = []
+      @roots = []
+      @log = []
+      @offset = offset
+      @last_length = nil
+      @closing = false
+    end
+
+    # The value that was folded from the entire event stream.
+    def value
+      @roots.size == 1 ? @roots.first : @roots
+    end
+
+    def size
+      @events.size
+    end
+
+    def [](index)
+      @events[index]
+    end
+
+    # Replaces the event at +index+. Proxy rules use this to insert
+    # themselves into the stream in place of the rule they are proxy for.
+    def []=(index, event)
+      @events[index] = event
+    end
+
+    def <<(event)
+      @events << event
+
+      if Rule === event
+        @closing = false
+        open(event)
+      elsif CLOSE == event
+        @closing = true
+      elsif Integer === event
+        close(event) if @closing
+        @closing = false
+      end
+
+      self
+    end
+
+    # Removes the events starting at +index+, discarding any values that
+    # were folded while they were appended.
+    def slice!(index, length)
+      rollback(index)
+      @events.slice!(index, length)
+    end
+
+    def pop
+      rollback(@events.size - 1)
+      @events.pop
+    end
+
+    # Returns the data needed to #replay the net effect of the events that
+    # were appended since +index+: the events themselves, the values that
+    # were committed to the enclosing frame, and the offset state.
+    def segment(index)
+      base = @stack.size
+      values = []
+      i = @log.size - 1
+
+      while i >= 0 && @log[i][0] >= index
+        values.unshift(@log[i][2]) if @log[i][1] == base
+        i -= 1
+      end
+
+      [@events[index..-1] || [], values, @offset, @last_length]
+    end
+
+    # Appends a segment previously captured with #segment, committing its
+    # folded values to the current frame.
+    def replay(entry)
+      events, values, offset, last_length = entry
+      @events.concat(events)
+
+      values.each do |value|
+        commit(value)
+      end
+
+      @offset = offset
+      @last_length = last_length
+    end
+
+  private
+
+    def open(rule)
+      frame = Frame.new(rule, nil, [], @offset, @last_length)
+      @offset += @last_length if @last_length
+      @last_length = nil
+      frame.start = @offset
+      @stack << frame
+    end
+
+    def close(length)
+      frame = @stack.pop
+      value = fold(frame, length)
+      @log << [@events.size - 1, @stack.size, value]
+      commit(value)
+      @last_length = length unless @last_length
+    end
+
+    def commit(value)
+      if @stack.empty?
+        @roots << value
+      else
+        @stack.last.children << value
+      end
+    end
+
+    # Restores the state as it was just before the event at +index+ was
+    # appended. The frame that was opened by that event carries the
+    # checkpoint; all values folded since are dropped from the log.
+    def rollback(index)
+      frame = @stack.pop
+      @offset = frame.offset
+      @last_length = frame.last_length
+      @log.pop while @log.last && @log.last[0] >= index
+    end
+
+    def fold(frame, length)
+      rule = frame.rule
+      folder = folder_for(rule)
+
+      if folder
+        folder.call(frame.children, @source[frame.start, length])
+      elsif rule.terminal?
+        @source[frame.start, length]
+      elsif Repeat === rule
+        frame.children
+      elsif frame.children.size == 1
+        frame.children.first
+      else
+        frame.children
+      end
+    end
+
+    # Returns the folder declared for the given +rule+. Folders given to
+    # Rule#parse_fold take precedence over folders set on rules themselves.
+    def folder_for(rule)
+      return @folders[rule] if @folders.key?(rule)
+
+      if rule.name && @folders.key?(rule.name)
+        @folders[rule.name]
+      elsif Proxy === rule && @folders.key?(rule.rule_name)
+        @folders[rule.rule_name]
+      else
+        rule.folder
+      end
+    end
+  end
+
   # Inclusion of this module into another extends the receiver with the grammar
   # helper methods in GrammarMethods. Although this module does not actually
   # provide any methods, constants, or variables to modules that include it, the
@@ -397,6 +610,20 @@ module Citrus
     def parse_file(path, options={})
       path = Pathname.new(path.to_str) unless Pathname === path
       parse(path, options)
+    end
+
+    # Parses the given +source+ using this grammar's root rule and returns a
+    # single folded value instead of a Match tree. Accepts the same +folders+
+    # and +options+ as Rule#parse_fold, plus the following:
+    #
+    # root::    The name of the root rule to start parsing at. Defaults to this
+    #           grammar's #root.
+    def parse_fold(source, folders={}, options={})
+      rule_name = options.delete(:root) || root
+      raise Error, "No root rule specified" unless rule_name
+      rule = rule(rule_name)
+      raise Error, "No rule named \"#{rule_name}\"" unless rule
+      rule.parse_fold(source, folders, options)
     end
 
     # Returns the name of this grammar as a string.
@@ -637,6 +864,12 @@ module Citrus
     # The module this rule uses to extend new matches.
     attr_reader :extension
 
+    # The default folder for this rule: a callable that computes this rule's
+    # folded value from an array of the folded values of its children and the
+    # matched string when using #parse_fold. Folders passed to #parse_fold
+    # take precedence over folders set on rules.
+    attr_accessor :folder
+
     # The default set of options to use when calling #parse.
     def default_options # :nodoc:
       { :consume  => true,
@@ -670,6 +903,38 @@ module Citrus
       end
 
       Match.new(input, events, opts[:offset])
+    end
+
+    # Attempts to parse the given +string+ and return a single folded value
+    # instead of a Match tree. +folders+ may be a hash mapping rule names
+    # (or Rule objects) to callable objects. When a rule matches, its folder
+    # is called with an array of the folded values of its children and the
+    # matched string, and its return value becomes the folded value of that
+    # match. Rules without a declared folder use default folding: terminals
+    # fold to their matched string, repeats fold to an array of the folded
+    # values of their children, and all other rules fold to the value of a
+    # single child or an array of the folded values of their children.
+    #
+    # No Match objects are created during a fold; values are computed as soon
+    # as each rule completes, and values that are computed inside branches
+    # that are rolled back during backtracking are discarded. Accepts the
+    # same +options+ as #parse.
+    def parse_fold(source, folders={}, options={})
+      opts = default_options.merge(options)
+
+      input = (opts[:memoize] ? MemoizedFoldInput : Input).new(source)
+      string = input.string
+      input.pos = opts[:offset] if opts[:offset] > 0
+
+      events = FoldEvents.new(folders, string, opts[:offset])
+      input.exec(self, events)
+      length = events[-1]
+
+      if !length || (opts[:consume] && length < (string.length - opts[:offset]))
+        raise ParseError, input
+      end
+
+      events.value
     end
 
     # Tests whether or not this rule matches on the given +string+. Returns the

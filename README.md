@@ -500,6 +500,52 @@ However, you do need to make sure that your extension modules are already loaded
 before using `Citrus.load` to load your grammar file.
 
 
+# Folding
+
+Sometimes you only need a single aggregated value from a parse (a sum, an
+evaluation, a count) and the full tree of `Match` objects is just dead
+weight. Use `parse_fold` to compute that value directly: as soon as a rule
+finishes matching, its folded value is computed from the folded values of its
+children, and no `Match` nodes are ever built.
+
+Folders are pure functions declared per rule, either in a hash passed to
+`parse_fold` or on the rules themselves via `Rule#folder`. A folder
+receives an array of the folded values of the rule's children and the matched
+string, and its return value becomes the folded value of that match.
+
+    Sum = Citrus::Grammar.new do
+      rule :list, all(:number, zero_or_more(all(',', :number)))
+      rule :number, /[0-9]+/
+      root :list
+    end
+
+    folds = {
+      :number => lambda {|children, string| string.to_i },
+      :list   => lambda {|children, string| children.flatten.grep(Integer).inject(0, :+) }
+    }
+
+    Sum.parse_fold('1,2,3', folds)
+    # => 6
+
+Rules without a declared folder use default folding: terminals fold to their
+matched string, repeats fold to an array of the folded values of their
+children, and all other rules fold to the value of a single child or an array
+of the folded values of their children.
+
+Values are computed as each rule completes; values produced inside branches
+that are rolled back during backtracking are discarded and never committed to
+the result. `parse_fold` accepts the same options as `parse` (including
+`:memoize`, `:offset`, and `:consume`), and folded values cached during a
+memoized fold are never shared between different sets of folders. Folders
+passed to `parse_fold` take precedence over folders set on rules.
+
+    grammar.rule(:number).folder = lambda {|children, string| string.to_i }
+    grammar.parse_fold('42')
+    # => 42
+
+Normal `parse` behavior is unchanged; use whichever fits the task.
+
+
 # Testing
 
 
